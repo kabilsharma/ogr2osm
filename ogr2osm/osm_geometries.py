@@ -10,9 +10,25 @@ accompany any distribution of this code.
 '''
 
 import logging
-from lxml import etree
+from xml.sax.saxutils import escape
 
 from .version import __program__
+
+_ATTR_ESCAPE_TABLE = {'"': '&quot;'}
+
+
+def _serialize_attributes(attr_pairs):
+    parts = []
+    for key, value in attr_pairs:
+        parts.append(f' {key}="{escape(str(value), _ATTR_ESCAPE_TABLE)}"')
+    return ''.join(parts)
+
+
+def _serialize_element(name, attr_pairs, children):
+    attributes = _serialize_attributes(attr_pairs)
+    if children:
+        return f'<{name}{attributes}>' + ''.join(children) + f'</{name}>'
+    return f'<{name}{attributes}/>'
 
 class OsmId:
     element_id_counter = 0
@@ -69,13 +85,13 @@ class OsmBoundary:
 
     def to_xml(self, significant_digits):
         formatting = ('%%.%df' % significant_digits)
-        xmlattrs = { 'minlon':(formatting % self.minlon).rstrip('0').rstrip('.'), \
-                     'minlat':(formatting % self.minlat).rstrip('0').rstrip('.'), \
-                     'maxlon':(formatting % self.maxlon).rstrip('0').rstrip('.'), \
-                     'maxlat':(formatting % self.maxlat).rstrip('0').rstrip('.') }
-        xmlobject = etree.Element('bounds', xmlattrs)
-
-        return etree.tostring(xmlobject, encoding='unicode')
+        attrs = [
+            ('minlon', (formatting % self.minlon).rstrip('0').rstrip('.')),
+            ('minlat', (formatting % self.minlat).rstrip('0').rstrip('.')),
+            ('maxlon', (formatting % self.maxlon).rstrip('0').rstrip('.')),
+            ('maxlat', (formatting % self.maxlat).rstrip('0').rstrip('.')),
+        ]
+        return _serialize_element('bounds', attrs, [])
 
 
 
@@ -103,14 +119,17 @@ class OsmGeometry:
         return self.__parents
 
 
-    def _add_tags_to_xml(self, xmlobject, suppress_empty_tags, max_tag_length, tag_overflow):
+    def _serialize_tags(self, suppress_empty_tags, max_tag_length, tag_overflow):
+        elements = []
         for (key, value_list) in self.tags.items():
             value = ';'.join([ v for v in value_list if v ])
             if len(value) > max_tag_length:
                 value = value[:(max_tag_length - len(tag_overflow))] + tag_overflow
             if value or not suppress_empty_tags:
-                tag = etree.Element('tag', { 'k':key, 'v':value })
-                xmlobject.append(tag)
+                elements.append(
+                    _serialize_element('tag', [('k', key), ('v', value)], [])
+                )
+        return elements
 
 
     def to_xml(self, attributes, significant_digits, \
@@ -130,17 +149,17 @@ class OsmNode(OsmGeometry):
     def to_xml(self, attributes, significant_digits, \
                      suppress_empty_tags, max_tag_length, tag_overflow):
         formatting = ('%%.%df' % significant_digits)
-        xmlattrs = { 'visible':'true', \
-                     'id':('%d' % self.id), \
-                     'lat':(formatting % self.y).rstrip('0').rstrip('.'), \
-                     'lon':(formatting % self.x).rstrip('0').rstrip('.') }
-        xmlattrs.update(attributes)
+        attr_pairs = [
+            ('visible', 'true'),
+            ('id', '%d' % self.id),
+            ('lat', (formatting % self.y).rstrip('0').rstrip('.')),
+            ('lon', (formatting % self.x).rstrip('0').rstrip('.')),
+        ]
+        attr_pairs.extend(attributes.items())
 
-        xmlobject = etree.Element('node', xmlattrs)
+        tags = self._serialize_tags(suppress_empty_tags, max_tag_length, tag_overflow)
 
-        self._add_tags_to_xml(xmlobject, suppress_empty_tags, max_tag_length, tag_overflow)
-
-        return etree.tostring(xmlobject, encoding='unicode')
+        return _serialize_element('node', attr_pairs, tags)
 
 
 
@@ -153,18 +172,19 @@ class OsmWay(OsmGeometry):
 
     def to_xml(self, attributes, significant_digits, \
                      suppress_empty_tags, max_tag_length, tag_overflow):
-        xmlattrs = { 'visible':'true', 'id':('%d' % self.id) }
-        xmlattrs.update(attributes)
+        attr_pairs = [
+            ('visible', 'true'),
+            ('id', '%d' % self.id),
+        ]
+        attr_pairs.extend(attributes.items())
 
-        xmlobject = etree.Element('way', xmlattrs)
+        children = [
+            _serialize_element('nd', [('ref', '%d' % node.id)], [])
+            for node in self.nodes
+        ]
+        children.extend(self._serialize_tags(suppress_empty_tags, max_tag_length, tag_overflow))
 
-        for node in self.nodes:
-            nd = etree.Element('nd', { 'ref':('%d' % node.id) })
-            xmlobject.append(nd)
-
-        self._add_tags_to_xml(xmlobject, suppress_empty_tags, max_tag_length, tag_overflow)
-
-        return etree.tostring(xmlobject, encoding='unicode')
+        return _serialize_element('way', attr_pairs, children)
 
 
 
@@ -184,11 +204,13 @@ class OsmRelation(OsmGeometry):
 
     def to_xml(self, attributes, significant_digits, \
                      suppress_empty_tags, max_tag_length, tag_overflow):
-        xmlattrs = { 'visible':'true', 'id':('%d' % self.id) }
-        xmlattrs.update(attributes)
+        attr_pairs = [
+            ('visible', 'true'),
+            ('id', '%d' % self.id),
+        ]
+        attr_pairs.extend(attributes.items())
 
-        xmlobject = etree.Element('relation', xmlattrs)
-
+        children = []
         for (member, role) in self.members:
             member_type = None
             if type(member) == OsmNode:
@@ -197,10 +219,13 @@ class OsmRelation(OsmGeometry):
                 member_type = 'way'
             elif type(member) == OsmRelation:
                 member_type = 'relation'
-            xmlmember = etree.Element('member', { 'type':member_type, \
-                                                  'ref':('%d' % member.id), 'role':role })
-            xmlobject.append(xmlmember)
+            child_attrs = [
+                ('type', member_type),
+                ('ref', '%d' % member.id),
+                ('role', role),
+            ]
+            children.append(_serialize_element('member', child_attrs, []))
 
-        self._add_tags_to_xml(xmlobject, suppress_empty_tags, max_tag_length, tag_overflow)
+        children.extend(self._serialize_tags(suppress_empty_tags, max_tag_length, tag_overflow))
 
-        return etree.tostring(xmlobject, encoding='unicode')
+        return _serialize_element('relation', attr_pairs, children)
